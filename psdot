@@ -1,0 +1,538 @@
+#!/usr/bin/python
+# Copyright (c) 2012, Robert Fielding <rf@tamasi.org>
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+#  * Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import argparse
+import datetime
+from dateutil.parser import *
+import dircache 
+import glob
+import hashlib
+import logging
+import matplotlib.pyplot as plt
+import networkx as nx
+import os
+import re
+import time
+
+PRECOMPILED = {
+    '%kernel': [
+        re.compile('^(kthread|migration/\d|watchdog/\d|ksoftirqd/\d)$'),
+        re.compile('^(cpuset|khelper|kdevtmpfs|netns|sync_supers|bdi-default)$'),
+        re.compile('^(kintegrityd/.*|kblockd/.*|ata_sff|khubd|md|kworker/.*|khungtaskd)$'),
+        re.compile('^(kswapd\d|ksmd|fsnotify_mark|ecryptfs-kthread|crypto/.*|kthrotld)$'),
+        re.compile('^(sci_eh_\d|devfreq_wq|kdmflush|jbd2/.*|iprt|kpsmoused)$'),
+        re.compile('^(cpuset|khelper|kdevtmpfs|netns|sync_supers|bdi-default)$'),
+        re.compile('^(ksoftirqd|jfs.*|xfs.*|glock_workqueue|delete_workqueu|kslowd.*)$'),
+        re.compile('^(kjournald|net_accel.*|sfc_netfront.*|kstriped|kthreadd)$'),
+        re.compile('^(kblockd|events/.*|async/mgr|aio/.*|xenwatch|xenbus|kseriod)$'),
+    ],
+    '%postfix': [
+        re.compile('^master$'),
+        re.compile('^qmgr$'),
+        re.compile('^tlsmgr$'),
+        re.compile('^smtpd?$'),
+        re.compile('^pickup$'),
+        re.compile('^proxymap$'),
+        re.compile('^postqueue$'),
+        re.compile('^cleanup$'),
+        re.compile('^postdrop$'),
+        re.compile('^trivial-rewrite$'),
+    ]
+}
+
+class ProcessRecord(object):
+    """ I am a file """
+    def __init__(self, file, ts, pid, ppid, rss, cpu, time, comm):
+        self.file = file
+	self.ts = ts
+        self.pid = pid
+        self.ppid = ppid
+        self.rss = float(rss)
+        self.cpu = float(cpu)
+        self.time = time
+        self.time_ts = 0
+        self.comm = comm
+        self.updatehash()
+        self.parse_time()
+
+    def parse_time(self):
+	# 2:28.70 
+        try:
+            m = re.match("(\d+):(\d+)[\.\:](\d+)", self.time)
+            hrs = int(m.group(1)) * 60 * 60
+            mins = int(m.group(2)) * 60
+            secs = int(m.group(3))	
+            ts = hrs + mins + secs 
+        except:
+            ts = 1
+
+        # logging.debug("debug: parse_time %s %d" % (self, ts))
+        self.time_ts = ts
+
+    def node_linewidth(self):
+
+	scale=25
+	size = int((float(self.cpu) + (scale-1)) / scale) 
+
+	return (size)
+
+    def node_fontsize(self):
+
+	scale = int(26214 / 4)
+	size = int((int(self.rss) + (scale-1)) / scale)
+#	if size > 48:
+#		size = 48
+
+	cpu = (float(self.cpu) + 9) / 10
+	
+	size = size + cpu
+
+	return (size)
+
+    def node_color(self):
+	# based on time
+	# RGB #000000 = 255,255,255 (hours, mins, seconds)
+
+        # H     0.0 red, 0.3 green, 0.5 cyan    (color)
+        # S     0.0 grey 0.5 washed, 1.0 pure   (contrast)
+        # V     0.0 black, 0.8 dim, 1.0 bright  (brightness)
+        
+        ts = self.time_ts
+
+        if (ts > (60 * 5)):
+            # long time, red (300)
+            hue = "0.0"
+        elif (ts > 10):
+            # mid time, green (10s)
+            hue = "0.25"
+        else:
+            # rapid, blue
+            hue = "0.50"
+
+	cpu = (100 - float(self.cpu)) / 100
+	saturation = str(cpu)
+
+	# lightness and darkness
+	value = 1.0
+
+	logging.debug("debug: %s time: %s cpu: %s h:%s s:%s v:%s" % (self,
+            self.time, self.cpu, hue, saturation, value))
+	
+	return "%s %s %s" % (hue, saturation, value)
+
+    def integer_divide(self, dividend, divisor):
+	return ((dividend + divisor // 2) // divisor)
+
+    def updatehash(self):
+        self.uuidhash = hashlib.sha1()
+        self.uuidhash.update(self.pid)
+        self.uuidhash.update(self.ppid)
+        self.uuidhash.update(self.comm)
+
+    def digest(self):
+        return self.uuidhash.hexdigest()
+
+    def __str__(self):
+
+        parts = self.comm.split(' ')
+        name = parts[0]
+        if name[0:1] == "/":
+            name = os.path.basename(name)
+
+        strlen = len(name) 
+        if strlen > 15:
+            name = name[strlen - 15:]
+	return name + " (" + str(self.time_ts) + "s)"
+
+class GraphBuilder(object):
+    def __init__(self, args):
+        self.args = args
+        self.pidstash = {}
+        self.uuidstash = {}
+        self.tsstash = {}
+	self.gr = nx.DiGraph()
+
+    def stash(self, psrow):
+        uuid = psrow.digest()
+	ts = psrow.ts
+	pid = psrow.pid
+
+        # track active nodes at this interval, use for rendering at interval 'ts'
+        if ts not in self.tsstash:
+            self.tsstash[ts] = {}
+        if uuid not in self.tsstash[ts]:
+            self.tsstash[ts][uuid] = psrow
+
+        if pid not in self.pidstash:
+            # track pids = uuids
+            self.pidstash[pid] = uuid
+        elif self.pidstash[pid] != uuid:
+            # pid reused, switching to new uuid
+            self.pidstash[pid] = uuid
+        else:
+            # do nothing
+            pass
+
+	if uuid not in self.uuidstash:
+            self.uuidstash[uuid] = psrow
+            self.gr.add_node(uuid, label=psrow, style="invis")
+
+    def link_parents(self):
+
+        for uuid in self.uuidstash:
+            psrow = self.uuidstash[uuid]
+
+            # link pid to ppid
+            if psrow.ppid == 0:
+                self.gr.node[uuid]['root'] = 'true'
+                pass
+            else:
+                if psrow.ppid in self.pidstash:
+                    puuid = self.pidstash[psrow.ppid]
+                    ppsrow = self.uuidstash[puuid]
+                    self.gr.add_edge(puuid, uuid, style='invis', color="0.0 0.0 0.0")
+                else:
+                    logging.error("error: didn't find %s ppid %s in pidstash; continue" %
+                            (psrow, psrow.ppid))
+
+    def compress_nodes(self, factor):
+        """ There are better answers to this in graph theory """
+
+        node_uuids = self.uuidstash.keys()
+        for uuid in node_uuids:
+            if uuid not in self.uuidstash:
+                continue
+
+            node = self.uuidstash[uuid]
+            nodes = nx.dfs_tree(self.gr, uuid)
+
+            for inner_uuid in nodes:
+                if inner_uuid not in self.uuidstash:
+                    continue
+
+                inner_node = self.uuidstash[inner_uuid]
+                path_length = nx.shortest_path_length(self.gr, uuid, inner_uuid)
+                if path_length > factor:
+
+                    print "debug: compress_nodes distance between %s (%s) => %s (%s) is %s" % (node, node.pid, inner_node, inner_node.pid, path_length)
+
+                    # which way up - init will have a large tree, but sh might
+                    # have a small or zero tree
+                    inner_nodes = nx.dfs_tree(self.gr, inner_uuid)
+                    if len(nodes) > len(inner_nodes):
+                        print "debug: node %s is bigger, trimming inner_node %s" % (node, inner_node)
+                        # for animation we need to skim through the timestamps
+                        for frame_ts in self.tsstash:
+                            try:
+                                frame_ts_node = self.tsstash[frame_ts][inner_uuid]
+                                for n in inner_nodes:
+                                    if n == inner_uuid:
+                                        continue;
+                                    frame_ts_n = self.tsstash[frame_ts][n]
+                                    frame_ts_node.rss += float(frame_ts_n.rss)
+                                    frame_ts_node.cpu += float(frame_ts_n.cpu)
+                                    frame_ts_node.time_ts += int(frame_ts_n.time_ts)
+                                    frame_ts_node.comm += "->" + frame_ts_n.comm
+                                self.tsstash[frame_ts][inner_uuid] = frame_ts_node 
+                            except:
+                                print "warn: exception tsstash inner_uuid %s" % inner_node
+
+                        # prune
+                        for n in inner_nodes:
+                            if n == inner_uuid:
+                                continue
+                            self.gr.remove_node(n)
+                            del self.uuidstash[n]
+
+                    else:
+                        logging.warn("warn: node % is smaller than %s!! does this happen?" % 
+                                    (node, inner_nodes))
+
+    def remove_process(self, comm):
+        """ Remove process that get in the way, like our collection 
+            process grab.shi
+        """
+        for uuid in self.uuidstash:
+            node = self.uuidstash[uuid]
+            if node.comm == comm:
+                for inner_uuid in nx.dfs_tree(self.gr, uuid):
+                    inner_node = self.uuidstash[inner_uuid]
+                    self.gr.remove_node(inner_uuid)
+                    del self.uuidstash[inner_uuid]
+                return
+        return 
+
+    def XXXremove_grab(self):
+        
+        for uuid in self.uuidstash:
+            node = self.uuidstash[uuid]
+
+            if node.comm == "grab.py" or node.comm == "grab.sh":
+                for inner_uuid in nx.dfs_tree(self.gr, uuid):
+                    inner_node = self.uuidstash[inner_uuid]
+                    self.gr.remove_node(inner_uuid)
+                    del self.uuidstash[inner_uuid]
+
+                #self.gr.remove_node(uuid)
+                return
+        return 
+
+    def fade_color(self, col):
+
+        m = re.match("\-?([\d\.]+) \-?([\d\.]+) \-?([\d\.]+)", col)
+        if m is None:
+            raise Exception("unable to match color %s" % col)
+        h = float(m.group(1))
+        s = float(m.group(2))
+        v = float(m.group(3))
+        s -= 0.2
+        if s < 0:
+            s = 0
+
+        newcol = "%f %f %f" % (h, s, v)
+        return newcol 
+
+    def reset_graph(self):
+	for n, nbrs in self.gr.adjacency_iter():
+            for nbr,eattr in nbrs.items():
+
+                if self.gr.node[nbr]['style'] != "invis":
+                    self.gr.node[nbr]["fillcolor"] = self.fade_color(self.gr.node[nbr]["fillcolor"])
+                    self.gr.node[nbr]["fontcolor"] = self.fade_color(self.gr.node[nbr]["fontcolor"])
+                    self.gr.node[nbr]["color"] = self.fade_color(self.gr.node[nbr]["color"])
+
+                    self.gr.edge[n][nbr]["color"] = self.fade_color(self.gr.edge[n][nbr]["color"])
+                    self.gr.edge[n][nbr]['style'] = 'dashed'
+
+    def render_frame(self, ts):
+	active_nodes = self.tsstash[ts] 
+	adjacency_checks = 0
+	for n, nbrs in self.gr.adjacency_iter():
+            adjacency_checks = adjacency_checks + 1
+            if n not in active_nodes:
+                continue
+
+            node = active_nodes[n]
+            # print "active node: %s" % node
+            color = node.node_color()
+            fontsize = node.node_fontsize() + 10
+            penwidth = node.node_linewidth() + 1
+            self.gr.node[n]['style'] = 'filled'
+            self.gr.node[n]['fillcolor'] = color
+            self.gr.node[n]['fontsize'] = fontsize
+            self.gr.node[n]['fontcolor'] = "0.0 0.0 0.0"
+            self.gr.node[n]['time_ts'] = node.time_ts
+            self.gr.node[n]['color'] = "0.0 0.0 0.0"
+
+            for nbr,eattr in nbrs.items():
+                if nbr in active_nodes:
+                        
+                    node = active_nodes[nbr]
+                    color = node.node_color()
+                    fontsize = node.node_fontsize() + 10
+                    penwidth = node.node_linewidth() + 1
+                    self.gr.node[nbr]['style'] = 'filled'
+                    self.gr.node[nbr]['fillcolor'] = color
+                    self.gr.node[nbr]['fontsize'] = fontsize
+                    self.gr.node[nbr]['fontcolor'] = "0.0 0.0 0.0"
+                    self.gr.node[nbr]['color'] = "0.0 0.0 0.0"
+                    self.gr.node[nbr]['time_ts'] = node.time_ts
+                    self.gr.edge[n][nbr]['color'] = color
+                    self.gr.edge[n][nbr]['penwidth'] = penwidth
+                    self.gr.edge[n][nbr]['style'] = 'solid'
+                    logging.debug("rendering frame %s %s" % (node, node.time_ts))
+	logging.info("covered %d adjacency_checks" % adjacency_checks)
+
+
+    def render_all(self):
+	for ts in sorted(self.tsstash.iterkeys()):
+            logging.debug("rendering frame %s" % ts)
+            self.render_frame(ts)
+
+            outfile = os.path.join(self.args.outdir,
+                    str(ts) + '.dot')
+            self.draw(outfile)
+            self.reset_graph()
+
+    def draw(self, dotfile):
+	# Draw as PNG
+	# print "draw_graphviz"
+	# nx.draw_random(self.gr)
+	nx.write_dot(self.gr,dotfile)
+
+class GrabParser(object):
+
+    #  PID  PPID    RSS      TIME COMM
+    #    1     0    828  11:55.33 /sbin/launchd
+    #  PID  PPID   RSS %CPU     TIME COMMAND
+    #    1     0  1176  0.0 00:00:00 init
+    #27590   563 413.5    0     0.38 rm
+
+
+    def __init__(self, store):
+        self.store = store
+
+    def excludefilter(self, comm):
+        
+        for regex in self.store.args.excludefilter:
+            if regex.match(comm):
+                return True
+        return False
+
+    def parse(self, file):
+	""" A file is s a single "frame" of activity; we want to 
+	    track this as a time interval
+        """
+        self.file = file
+
+	data_rows = 0
+        fd = open(file, 'r')
+        for line in fd:
+
+	    line = line.strip()
+            fields = re.split('\s+', line)
+            if fields[0] == 'PID':
+		continue
+
+	    # store time interval
+	    ts = os.path.basename(file).split('.',1)[0]
+
+            if self.store.args.excludefilter is not None \
+                    and self.excludefilter(fields[5]):
+                continue
+	    psrow = ProcessRecord(file, ts, fields[0], fields[1], fields[2], fields[3], fields[4], fields[5])
+            logging.debug("%s: parsed row: %s" % (file, psrow))
+	    self.store.stash(psrow)
+	    data_rows = data_rows + 1
+	fd.close()
+        logging.info("%s: parsed %d rows" % (file, data_rows))
+
+class Main(object):
+
+    def __init__(self):
+        self.args = []
+
+    def parse_args(self):
+
+        parser = argparse.ArgumentParser(description='Parse telemetry files')
+        parser.add_argument('--pathname', default="data",
+                            help="specify a directory containing files from grab.sh")
+        parser.add_argument('--outdir', default="out",
+                            help="specify a directory to output to")
+        parser.add_argument('--start',
+                            help="timestamp to start from")
+        parser.add_argument('--finish',
+                            help="timestamp to finish")
+        parser.add_argument('--excludefilter', nargs="+",
+                            help="excludefilter regexs")
+        parser.add_argument('--compress',
+                            help="compress n")
+        self.args = parser.parse_args()
+
+	if self.args.start is not None:
+            if not re.match('\d{10}', self.args.start):
+                self.args.start = int(time.mktime(parse(self.args.start, fuzzy=True).utctimetuple()))
+	
+	if self.args.finish is not None:
+            if not re.match('\d{10}', self.args.finish):
+                self.args.finish = int(time.mktime(parse(self.args.finish, fuzzy=True).utctimetuple()))
+
+	if self.args.start is not None and self.args.finish is not None:
+            if self.args.start > self.args.finish:
+                t = self.args.start
+                self.args.start = self.args.finish
+                self.args.finish = t
+	if self.args.start is not None:
+            self.args.start = int(self.args.start)
+	if self.args.finish is not None:
+            self.args.finish = int(self.args.finish)
+
+        if not os.path.exists(self.args.outdir):
+            os.mkdir(self.args.outdir)
+
+        if self.args.excludefilter:
+            compiled = []
+            for regex in self.args.excludefilter:
+                if regex in PRECOMPILED:
+                    compiled += PRECOMPILED[regex]
+                else:
+                    cr = re.compile(regex)
+                    compiled.append(cr)
+            self.args.excludefilter = compiled
+
+
+        logging.debug("args: %s", self.args)
+
+    def main(self):
+
+        self.parse_args();
+
+	path = os.path.expandvars(os.path.expanduser(self.args.pathname))
+	if not os.path.exists(path): 
+            raise Exception("path doesnt exist: %s" % path)
+
+	frames = sorted(dircache.listdir(path))
+	
+        store = GraphBuilder(self.args)
+        fileparser = GrabParser(store)
+
+	readfile = 0
+        t1 = time.time()
+        read_counter=0
+        for frame in frames:
+	    if not re.match('\d+\.ps', frame):
+		continue
+
+	    file_ts = int(os.path.basename(frame).split('.',1)[0])
+	    # perform range handling (if requested)
+	    if readfile == 0 and self.args.start is not None:
+		if file_ts >= self.args.start:
+                    readfile = 1
+	    else:
+		readfile = 1
+	    if readfile == 1 and self.args.finish is not None:
+		if file_ts > self.args.finish:
+                    readfile = 0
+
+	    if readfile == 1:
+		fileparser.parse(os.path.join(path,frame))
+            read_counter += 1
+
+        logging.debug("read input: %d in %s" % (read_counter, time.time() - t1))
+
+        store.link_parents()
+        store.remove_process("grab.sh")
+        if self.args.compress:
+            store.compress_nodes(self.args.compress)
+
+	store.render_all()
+
+if __name__ == "__main__":
+
+    logging.basicConfig(level="DEBUG")
+    x = Main()
+    try:
+        x.main()
+    except Exception as ex:
+        logging.error("exception: %s" % ex)
